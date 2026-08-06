@@ -4,7 +4,6 @@ enum TipKind: String, Identifiable {
     case activation = "生效说明"
     case deactivation = "失效说明"
     case removeProxy = "关闭 WiFi 代理"
-    case certificate = "证书问题"
     case proxySetup = "配置代理"
     case rewriteFailed = "改写失败"
     var id: String { rawValue }
@@ -12,6 +11,7 @@ enum TipKind: String, Identifiable {
 
 struct TipSheetView: View {
     let kind: TipKind
+    var runtimeMode: ProxyRuntimeMode = .localWiFi
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -19,10 +19,9 @@ struct TipSheetView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     switch kind {
-                    case .activation: ActivationTipContent(dismiss: { dismiss() })
-                    case .deactivation: DeactivationTipContent(dismiss: { dismiss() })
+                    case .activation: ActivationTipContent(runtimeMode: runtimeMode, dismiss: { dismiss() })
+                    case .deactivation: DeactivationTipContent(runtimeMode: runtimeMode, dismiss: { dismiss() })
                     case .removeProxy: RemoveProxyTipContent(dismiss: { dismiss() })
-                    case .certificate: CertificateTipContent(dismiss: { dismiss() })
                     case .proxySetup: ProxySetupTipContent(dismiss: { dismiss() })
                     case .rewriteFailed: RewriteFailedTipContent(dismiss: { dismiss() })
                     }
@@ -67,15 +66,19 @@ private struct TipCloseButton: View {
 // MARK: - 生效说明
 
 struct ActivationTipContent: View {
+    var runtimeMode: ProxyRuntimeMode = .localWiFi
     let dismiss: () -> Void
 
     var body: some View {
         GroupBox(label: Label("让虚拟定位生效", systemImage: "checklist")) {
             VStack(alignment: .leading, spacing: 10) {
+                if runtimeMode == .thirdParty {
+                    step(0, "确认第三方代理已开启", "保持已导入的 WLOC 模块、HTTPS 解密和第三方代理/VPN 连接开启。")
+                }
                 step(1, "开启飞行模式", "从控制中心打开飞行模式（点飞机图标），Wi‑Fi 会自动断开。这是为了清除 iOS 的定位缓存。等待 2 秒。")
                 step(2, "关闭 Wi‑Fi", "从控制中心再点一下 Wi‑Fi 图标，确认 Wi‑Fi 已关闭。等待 2 秒。")
                 systemStep(3, "关闭系统定位服务", "打开系统「设置 → 隐私与安全性 → 定位服务」，关闭顶部的总开关。等待 2 秒。")
-                step(4, "打开 Wi‑Fi，启动虚拟定位", "从控制中心打开 Wi‑Fi（飞行模式保持开启），进入 App 点底部「开始虚拟定位」。等待 2 秒。")
+                step(4, "打开 Wi‑Fi，启动虚拟定位", runtimeMode == .thirdParty ? "从控制中心打开 Wi‑Fi（飞行模式保持开启），确认第三方代理已连接。坐标已经同步到第三方代理。等待 2 秒。" : "从控制中心打开 Wi‑Fi（飞行模式保持开启），进入 App 点底部「开始虚拟定位」。等待 2 秒。")
                 step(5, "关闭飞行模式", "从控制中心关闭飞行模式。等待 2 秒。")
                 systemStep(6, "重新开启定位服务", "再次进入「设置 → 隐私与安全性 → 定位服务」，打开总开关。完成后打开地图验证定位是否已变化。")
             }.padding(.vertical, 4)
@@ -119,6 +122,7 @@ struct ActivationTipContent: View {
 // MARK: - 失效说明
 
 struct DeactivationTipContent: View {
+    var runtimeMode: ProxyRuntimeMode = .localWiFi
     let dismiss: () -> Void
 
     var body: some View {
@@ -127,7 +131,11 @@ struct DeactivationTipContent: View {
                 step(1, "开启飞行模式", "从控制中心打开飞行模式，Wi‑Fi 会自动断开。等待 2 秒。")
                 step(2, "关闭 Wi‑Fi", "从控制中心确认 Wi‑Fi 已关闭。等待 2 秒。")
                 systemStep(3, "关闭系统定位服务", "打开「设置 → 隐私与安全性 → 定位服务」，关闭总开关。等待 2 秒。")
-                systemStep(4, "打开 Wi‑Fi，移除代理", "从控制中心打开 Wi‑Fi。然后进入「设置 → 无线局域网 → 点 WiFi 右侧 (i) → HTTP 代理」，选择「关闭」后存储。等待 2 秒。")
+                if runtimeMode == .thirdParty {
+                    step(4, "确认坐标已清除", "App 已通知第三方代理清除虚拟坐标。保持网络可用并等待 2 秒，让系统重新获取真实定位。")
+                } else {
+                    systemStep(4, "打开 Wi‑Fi，移除代理", "从控制中心打开 Wi‑Fi。然后进入「设置 → 无线局域网 → 点 WiFi 右侧 (i) → HTTP 代理」，选择「关闭」后存储。等待 2 秒。")
+                }
                 step(5, "关闭飞行模式", "从控制中心关闭飞行模式。等待 2 秒。")
                 systemStep(6, "重新开启定位服务", "再次进入「设置 → 隐私与安全性 → 定位服务」打开总开关。打开地图验证定位是否恢复。")
             }.padding(.vertical, 4)
@@ -178,24 +186,6 @@ struct RemoveProxyTipContent: View {
                 Text("停止虚拟定位后，需要手动移除 WiFi 代理配置，否则可能无法上网。\n\n1. 打开「设置 → 无线局域网」\n2. 点击当前 WiFi 右侧 (i) 图标\n3. 找到「HTTP 代理」\n4. 选择「关闭」\n5. 点右上角「存储」")
                     .font(.caption).foregroundStyle(.primary)
                 Button { openSettings(.wifi) } label: {
-                    Label("去设置", systemImage: "arrow.up.right.square").font(.caption)
-                }.buttonStyle(.bordered).tint(.blue)
-            }.padding(.vertical, 4)
-        }
-    }
-}
-
-// MARK: - 证书问题
-
-struct CertificateTipContent: View {
-    let dismiss: () -> Void
-
-    var body: some View {
-        GroupBox(label: Label("证书未安装或未信任", systemImage: "lock.shield")) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("代理的 HTTPS 请求被系统拦截了，原因是 CA 证书未完成安装或信任。\n\n请依次检查：\n1. 打开「设置 → 通用 → VPN与设备管理」，确认 WLOC CA 证书已安装。如果没有，请删除旧证书后回到 App 重新下载安装\n2. 打开「设置 → 通用 → 关于本机 → 证书信任设置」，找到 WLOC CA 开启开关\n\n⚠️ 每次重装 App 都需要重新下载安装证书。如报 TLS 错误，请删除旧证书后重装。")
-                    .font(.caption).foregroundStyle(.primary)
-                Button { openSettings(.general) } label: {
                     Label("去设置", systemImage: "arrow.up.right.square").font(.caption)
                 }.buttonStyle(.bordered).tint(.blue)
             }.padding(.vertical, 4)

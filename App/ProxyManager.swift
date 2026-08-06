@@ -25,9 +25,9 @@ final class ProxyManager: ObservableObject {
             let lon = settings.flatMap { $0.enabled ? $0.longitude : nil } ?? 0
             let enabled = (settings?.enabled ?? false) ? CInt(1) : CInt(0)
             let accuracy = CInt(settings?.accuracy ?? 25)
-            RuntimeLogger.info("APP", "坐标转换", "启动代理: WGS-84", details: [
-                "lat": String(lat), "lon": String(lon)
-            ])
+            if enabled != 0 {
+                RuntimeLogger.info("APP", "坐标转换", "启动代理: 恢复上次 WGS-84 定位")
+            }
             let result: UInt = authority.certPEM.withCString { cp in
                 authority.keyPEM.withCString { kp in
                     UInt(wloccore_startproxy(UnsafeMutablePointer(mutating: cp), UnsafeMutablePointer(mutating: kp), CDouble(lat), CDouble(lon), enabled, accuracy))
@@ -62,8 +62,7 @@ final class ProxyManager: ObservableObject {
         RuntimeLogger.info("APP", "Proxy.coords", "写入坐标", details: [
             "revision": String(coordinateRevision),
             "enabled": String(enabled),
-            "lat": String(lat),
-            "lon": String(lon)
+            "accuracy": String(accuracy)
         ])
         return coordinateRevision
     }
@@ -120,15 +119,31 @@ final class ProxyManager: ObservableObject {
         return (Double(r.r0), Double(r.r1), r.r2 != 0)
     }
 
-    func openCertificateDownload() async {
+    @discardableResult
+    func openCertificateDownload() async -> Bool {
         do {
             if !isRunning { try await start() }
             // 本地代理直接提供 CA 证书下载
-            guard let url = URL(string: "http://127.0.0.1:8888/cert") else { return }
-            await MainActor.run { UIApplication.shared.open(url) }
+            guard let url = URL(string: "http://127.0.0.1:8888/cert") else {
+                error = "证书下载地址无效"
+                return false
+            }
+            let opened = await withCheckedContinuation { continuation in
+                UIApplication.shared.open(url, options: [:]) { accepted in
+                    continuation.resume(returning: accepted)
+                }
+            }
+            guard opened else {
+                error = "系统无法打开证书下载页面，请稍后重试"
+                RuntimeLogger.warning("APP", "Certificate", "系统拒绝打开证书下载地址")
+                return false
+            }
+            error = nil
+            return true
         } catch {
             self.error = "启动代理失败: \(error.localizedDescription)"
             RuntimeLogger.error("APP", "Certificate", "打开证书下载失败", error: error)
+            return false
         }
     }
 

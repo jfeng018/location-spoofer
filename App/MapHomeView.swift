@@ -25,11 +25,33 @@ private struct RealtimeLocationRequestContext {
     let showFailureAlert: Bool
 }
 
+private enum RealtimeCoordinateSource: Equatable {
+    case mapKitBluePoint
+    case coreLocation
+
+    @MainActor
+    var coordinateSystem: CoordinateConverter.MapCoordinateSystem {
+        switch self {
+        case .mapKitBluePoint: return CoordinateConverter.currentMapCoordinateSystem
+        case .coreLocation: return .wgs84
+        }
+    }
+
+    var diagnosticName: String {
+        switch self {
+        case .mapKitBluePoint: return "MapKit地图蓝点"
+        case .coreLocation: return "CLLocationManager"
+        }
+    }
+}
+
 struct MapHomeView: View {
     @ObservedObject var setup: SetupCoordinator
-    @StateObject private var favorites = FavoriteLocationStore()
+    @StateObject private var favorites: FavoriteLocationStore
     @StateObject private var actions = LocationActionCoordinator()
     @ObservedObject private var proxy = ProxyManager.shared
+    @ObservedObject private var runtimeMode = ProxyRuntimeModeStore.shared
+    @ObservedObject private var thirdPartyProxy = ThirdPartyProxyManager.shared
     @StateObject private var realtime = RealtimeLocationManager.shared
     @StateObject private var mapState: MapLocationState
     @ObservedObject private var net = NetworkMonitor.shared
@@ -39,14 +61,13 @@ struct MapHomeView: View {
     @State private var isSearching = false
     @State private var searchRequestID: UInt64 = 0
     @State private var searchError = ""
-    @State private var mapDidInitialize = false
+    @State private var mapRuntimeDidStart = false
     @State private var activeSheet: HomeSheet?
     @State private var showEnableTip = false
     @State private var showDisableTip = false
     @State private var activeTip: TipKind?
     @State private var manualHint = ""
-    @AppStorage("activationTipCount") private var activationTipCount = 0
-    @AppStorage("activationTipDisabled") private var activationTipDisabled = false
+    private let tipPreferences = VirtualLocationTipPreferences()
     @State private var editingFavorite: FavoriteLocation?
     @State private var editName = ""
     @State private var reverseGeocodeTask: Task<Void, Never>?
@@ -54,6 +75,9 @@ struct MapHomeView: View {
     @State private var showLocationAlert = false
     @State private var realtimeRequestTask: Task<Void, Never>?
     @State private var realtimeRequestContext: RealtimeLocationRequestContext?
+    @State private var wifiChangeObserverToken: UUID?
+    @State private var wifiVerificationTask: Task<Void, Never>?
+    @State private var wifiVerificationID: UUID?
     @State private var copyConfirmed = false
     @State private var spoofState: SpoofState = .idle
     @State private var locationOperationTask: Task<Void, Never>?
@@ -61,60 +85,117 @@ struct MapHomeView: View {
     // 激活时的坐标（本地存，绕过 C 桥接层精度丢失）
     @State private var activeSpoofLat: Double?
     @State private var activeSpoofLon: Double?
+    @State private var lastSpoofDiagnosisSystem: CoordinateConverter.MapCoordinateSystem?
+    @State private var hasLoggedSpoofDiagnosis = false
 
     init(setup: SetupCoordinator) {
         self.setup = setup
+        let favoriteStore = FavoriteLocationStore()
+        _favorites = StateObject(wrappedValue: favoriteStore)
         let savedCoord = LastCoordinateStore.load()
-        let initialZoom = ViewportStore.loadOrDefault()
-        // 持久化存的是 WGS-84，直接转当前瓦片坐标系显示
+        let initialZoom = savedCoord?.zoomMeters ?? ViewportStore.loadOrDefault()
+        let selectedFavorite = favoriteStore.selectedFavorite
         let initialCoord: CLLocationCoordinate2D
-        if let coord = savedCoord?.coordinate {
-            let display = CoordinateConverter.toDisplay(lat: coord.latitude, lon: coord.longitude)
-            initialCoord = CLLocationCoordinate2D(latitude: display.lat, longitude: display.lon)
+        let initialSource: MapSelectionSource
+        let initialName: String?
+        if let saved = savedCoord {
+            initialCoord = saved.coordinate(for: CoordinateConverter.currentMapCoordinateSystem)
+            if let selectedFavorite,
+               selectedFavorite.coordinatePair.matchesWGS84(
+                   latitude: saved.coordinatePair.wgs84.latitude,
+                   longitude: saved.coordinatePair.wgs84.longitude
+               ) {
+                initialSource = .favorite(selectedFavorite.id)
+                initialName = selectedFavorite.name
+            } else {
+                initialSource = .initial
+                initialName = nil
+            }
+        } else if let selectedFavorite {
+            initialCoord = selectedFavorite.coordinatePair.coordinate(for: CoordinateConverter.currentMapCoordinateSystem)
+            initialSource = .favorite(selectedFavorite.id)
+            initialName = selectedFavorite.name
         } else {
-            initialCoord = CLLocationCoordinate2D(latitude: 22.544577, longitude: 113.94114)
+            // The fallback location is defined as WGS-84 and rendered in the
+            // coordinate system resolved by the startup gate.
+            initialCoord = CoordinateConverter.coordinatePair(
+                lat: 22.544577,
+                lon: 113.94114,
+                mapCoordinateSystem: .wgs84
+            ).coordinate(for: CoordinateConverter.currentMapCoordinateSystem)
+            initialSource = .initial
+            initialName = nil
         }
+        RuntimeLogger.info("APP", "地图", "初始化", details: [
+            "zoom": String(initialZoom),
+            "有缓存": String(savedCoord != nil),
+            "初始来源": String(describing: initialSource),
+            "地图标准": CoordinateConverter.currentMapCoordinateSystem.rawValue
+        ])
         _mapState = StateObject(wrappedValue: MapLocationState(
             initialCoordinate: initialCoord,
-            initialViewportMeters: initialZoom
+            initialViewportMeters: initialZoom,
+            initialSource: initialSource,
+            initialName: initialName
         ))
+
+        if ProxyRuntimeModeStore.shared.mode == .localWiFi,
+           let settings = WlocSettingsStore.load(), settings.enabled {
+            _spoofState = State(initialValue: .active)
+            _activeSpoofLat = State(initialValue: settings.latitude)
+            _activeSpoofLon = State(initialValue: settings.longitude)
+        }
     }
 
     var body: some View {
         ZStack {
             MapViewRepresentable(
                 selection: mapState.selection,
+                initialViewportMeters: mapState.viewportMeters,
                 cameraCommand: mapState.cameraCommand,
                 onRealtimeLocationChanged: { location in
                     handleNativeRealtimeLocation(location)
                 },
                 onUserCenterChanged: { coordinate, distance in
                     mapState.updateViewport(distanceMeters: distance)
-let previousRevision = mapState.selection.revision
+                    let previousRevision = mapState.selection.revision
                     let revision = mapState.selectUserMapCenter(coordinate)
                     guard revision != previousRevision else { return }
-                    let wgs = CoordinateConverter.toStored(lat: coordinate.latitude, lon: coordinate.longitude)
-                    LastCoordinateStore.save(lat: wgs.lat, lon: wgs.lon)
+                    let pair = CoordinatePair(
+                        mapCoordinate: coordinate,
+                        mapCoordinateSystem: CoordinateConverter.currentMapCoordinateSystem
+                    )
+                    LastCoordinateStore.save(
+                        coordinatePair: pair,
+                        zoomMeters: mapState.viewportMeters
+                    )
                     favorites.select(nil)
-                    scheduleGeocode(coordinate: coordinate, revision: revision)
+                    scheduleGeocode(pair: pair, revision: revision)
                 },
                 onViewportChanged: { distance in
                     mapState.updateViewport(distanceMeters: distance)
                 },
                 onMapTap: { coordinate in
                     favorites.select(nil)
-let revision = mapState.selectMapTap(coordinate)
-                    let wgs = CoordinateConverter.toStored(lat: coordinate.latitude, lon: coordinate.longitude)
-                    LastCoordinateStore.save(lat: wgs.lat, lon: wgs.lon)
-                    scheduleGeocode(coordinate: coordinate, revision: revision)
+                    let revision = mapState.selectMapTap(coordinate)
+                    let pair = CoordinatePair(
+                        mapCoordinate: coordinate,
+                        mapCoordinateSystem: CoordinateConverter.currentMapCoordinateSystem
+                    )
+                    LastCoordinateStore.save(
+                        coordinatePair: pair,
+                        zoomMeters: mapState.viewportMeters
+                    )
+                    scheduleGeocode(pair: pair, revision: revision)
                 },
                 onUserZoomChanged: { distance in
                     ViewportStore.save(distance)
+                    LastCoordinateStore.updateZoom(distance)
                 },
                 onZoomIn: { mapState.zoom(by: 0.5) },
                 onZoomOut: { mapState.zoom(by: 2) }
             )
-                .ignoresSafeArea(.container)
+            .ignoresSafeArea(.container)
 
             VStack(spacing: 10) {
                 topControls
@@ -172,7 +253,7 @@ let revision = mapState.selectMapTap(coordinate)
             }
         }
         .sheet(item: $activeTip) { kind in
-            TipSheetView(kind: kind)
+            TipSheetView(kind: kind, runtimeMode: runtimeMode.mode)
         }
         .alert("无法直接跳转", isPresented: Binding(
             get: { !manualHint.isEmpty },
@@ -181,29 +262,48 @@ let revision = mapState.selectMapTap(coordinate)
             Button("知道了", role: .cancel) {}
         } message: { Text(manualHint) }
         .onAppear {
-            initializeMap()
-            NetworkMonitor.shared.onWiFiChanged = { [self] in
-                guard spoofState == .active else { return }
-                Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 3_000_000_000)
-                    guard spoofState == .active else { return }
-                    let target = currentSelectionFavorite
-                    let result = await setup.runVerificationTest(testLat: target.latitude, testLon: target.longitude)
-                    if !result.isSuccess, let tip = result.tipKind {
-                        activeTip = tip
-                    }
-                }
+            startMapRuntimeOnce()
+            // ContentView performs the startup environment test before this map
+            // view is constructed. Do not immediately run it again here.
+            if runtimeMode.mode == .localWiFi {
+                registerWiFiChangeObserver()
+            } else {
+                refreshThirdPartyState()
             }
         }
-        .onChange(of: net.isAirplaneMode) { airplane in
-            if !airplane {
-                Task { await setup.refreshTrust() }
+        .onDisappear {
+            if let token = wifiChangeObserverToken {
+                net.removeWiFiChangeObserver(token)
+                wifiChangeObserverToken = nil
             }
+            wifiVerificationTask?.cancel()
+            wifiVerificationTask = nil
+            wifiVerificationID = nil
         }
         .onChange(of: proxy.isRunning) { running in
-            if !running && spoofState == .active {
+            if runtimeMode.mode == .localWiFi, !running && spoofState == .active {
                 spoofState = .idle
                 actions.clear()
+            }
+        }
+        .onChange(of: runtimeMode.mode) { mode in
+            locationOperationTask?.cancel()
+            locationOperationTask = nil
+            locationOperationID &+= 1
+            if let token = wifiChangeObserverToken {
+                net.removeWiFiChangeObserver(token)
+                wifiChangeObserverToken = nil
+            }
+            wifiVerificationTask?.cancel()
+            wifiVerificationTask = nil
+            activeSpoofLat = nil
+            activeSpoofLon = nil
+            if mode == .localWiFi {
+                spoofState = actions.virtualLocationEnabled ? .active : .idle
+                registerWiFiChangeObserver()
+            } else {
+                spoofState = .idle
+                refreshThirdPartyState()
             }
         }
         .sheet(isPresented: $showEnableTip) { enableTipSheet }
@@ -318,7 +418,7 @@ let revision = mapState.selectMapTap(coordinate)
                         .onTapGesture {
                             let text = String(format: "%.6f, %.6f", mapState.selection.coordinate.latitude, mapState.selection.coordinate.longitude)
                             UIPasteboard.general.string = text
-                            RuntimeLogger.info("APP", "地图", "复制坐标: \(text)")
+                            RuntimeLogger.info("APP", "地图", "已复制坐标")
                             copyConfirmed = true
                             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copyConfirmed = false }
                         }
@@ -337,13 +437,13 @@ let revision = mapState.selectMapTap(coordinate)
                 Spacer()
                 // 帮助说明按钮
                 Button {
-                    if actions.virtualLocationEnabled {
+                    if spoofState == .active {
                         activeTip = .activation
                     } else {
-                        showDisableTip = true
+                        activeTip = .deactivation
                     }
                 } label: {
-                    Text(actions.virtualLocationEnabled ? "无法生效？" : "无法取消？")
+                    Text(spoofState == .active ? "无法生效？" : "无法取消？")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 8)
@@ -358,16 +458,19 @@ let revision = mapState.selectMapTap(coordinate)
                         return
                     }
                     let snapshot = currentSelectionFavorite
-                    let wgs = CoordinateConverter.toStored(lat: snapshot.latitude, lon: snapshot.longitude)
+                    RuntimeLogger.info("APP", "坐标转换", "保存当前选点为收藏", details: [
+                        "当前地图标准": CoordinateConverter.currentMapCoordinateSystem.diagnosticName,
+                        "输入字段": CoordinateConverter.currentMapCoordinateSystem.diagnosticName,
+                        "持久化字段": "国际标准(WGS-84)+国内标准(GCJ-02)"
+                    ])
                     let favorite = favorites.save(
                         name: snapshot.name,
-                        latitude: wgs.lat,
-                        longitude: wgs.lon,
+                        mapCoordinate: mapState.selection.coordinate,
+                        mapCoordinateSystem: CoordinateConverter.currentMapCoordinateSystem,
                         accuracy: snapshot.accuracy
                     )
-                    let display = CoordinateConverter.toDisplay(lat: favorite.latitude, lon: favorite.longitude)
                     mapState.selectFavorite(
-                        CLLocationCoordinate2D(latitude: display.lat, longitude: display.lon),
+                        favorite.coordinatePair.coordinate(for: CoordinateConverter.currentMapCoordinateSystem),
                         id: favorite.id,
                         name: favorite.name
                     )
@@ -435,11 +538,20 @@ let revision = mapState.selectMapTap(coordinate)
         guard spoofState == .active,
               let sLat = activeSpoofLat,
               let sLon = activeSpoofLon else { return false }
-        return abs(sLat - mapState.selection.coordinate.latitude) > 0.0001
-            || abs(sLon - mapState.selection.coordinate.longitude) > 0.0001
+        return !currentSelectionFavorite.coordinatePair.matchesWGS84(
+            latitude: sLat,
+            longitude: sLon
+        )
     }
 
     private var buttonTitle: String {
+        if runtimeMode.mode == .thirdParty {
+            switch spoofState {
+            case .idle: return "同步到第三方代理"
+            case .verifying: return "检测并同步中…"
+            case .active: return "停止第三方虚拟定位"
+            }
+        }
         switch spoofState {
         case .idle: return "开始虚拟定位"
         case .verifying: return "验证环境中…"
@@ -468,6 +580,7 @@ let revision = mapState.selectMapTap(coordinate)
 
     private func beginLocationOperation() {
         guard spoofState != .verifying, locationOperationTask == nil else { return }
+        let wasActive = spoofState == .active
         locationOperationID &+= 1
         let operationID = locationOperationID
         let selectionRevision = mapState.selection.revision
@@ -475,7 +588,40 @@ let revision = mapState.selectMapTap(coordinate)
         spoofState = .verifying
 
         locationOperationTask = Task { @MainActor in
-            let result = await setup.runVerificationTest(testLat: target.latitude, testLon: target.longitude)
+            if runtimeMode.mode == .thirdParty {
+                do {
+                    let response = try await thirdPartyProxy.save(target)
+                    guard !Task.isCancelled,
+                          operationID == locationOperationID,
+                          runtimeMode.mode == .thirdParty else {
+                        return
+                    }
+                    // The remote write has already succeeded. If the user moved
+                    // the map meanwhile, keep this target active and let
+                    // needsSwitchButton offer syncing the newer selection.
+                    spoofState = .active
+                    activeSpoofLat = response.latitude
+                    activeSpoofLon = response.longitude
+                    RuntimeLogger.info("APP", "定位", "第三方代理坐标同步成功", details: [
+                        "坐标标准": "WGS-84",
+                        "客户端模式": "测试模式",
+                        "选点期间发生变化": String(selectionRevision != mapState.selection.revision)
+                    ])
+                    presentSuccessfulOperationTip(.activation)
+                } catch {
+                    guard operationID == locationOperationID else { return }
+                    // A failed replacement does not clear the coordinate that
+                    // was already persisted inside the third-party client.
+                    spoofState = wasActive ? .active : .idle
+                    manualHint = error.localizedDescription
+                }
+                if operationID == locationOperationID {
+                    locationOperationTask = nil
+                }
+                return
+            }
+
+            let result = await setup.runVerificationTest()
             guard !Task.isCancelled,
                   operationID == locationOperationID,
                   selectionRevision == mapState.selection.revision else {
@@ -492,15 +638,16 @@ let revision = mapState.selectMapTap(coordinate)
                 if applied {
                     activeSpoofLat = target.latitude
                     activeSpoofLon = target.longitude
+                    lastSpoofDiagnosisSystem = nil
+                    hasLoggedSpoofDiagnosis = false
                 }
                 RuntimeLogger.info("APP", "定位", "验证结果", details: [
                     "success": "true",
                     "applied": String(applied),
                     "spoofState": String(describing: spoofState)
                 ])
-                if applied && !activationTipDisabled {
-                    showEnableTip = true
-                    activationTipCount += 1
+                if applied {
+                    presentSuccessfulOperationTip(.activation)
                 }
             } else {
                 spoofState = actions.virtualLocationEnabled ? .active : .idle
@@ -508,7 +655,11 @@ let revision = mapState.selectMapTap(coordinate)
                     "result": result.id,
                     "spoofState": String(describing: spoofState)
                 ])
-                if let tip = result.tipKind {
+                if result == .certNotTrusted {
+                    RuntimeLogger.warning("APP", "定位", "开启前检测发现证书异常，进入证书安装引导")
+                    activeTip = nil
+                    setup.applyVerificationResult(result)
+                } else if let tip = result.tipKind {
                     activeTip = tip
                 }
             }
@@ -520,11 +671,48 @@ let revision = mapState.selectMapTap(coordinate)
         locationOperationTask?.cancel()
         locationOperationTask = nil
         locationOperationID &+= 1
+        if runtimeMode.mode == .thirdParty {
+            spoofState = .verifying
+            locationOperationTask = Task { @MainActor in
+                do {
+                    try await thirdPartyProxy.clear()
+                    spoofState = .idle
+                    activeSpoofLat = nil
+                    activeSpoofLon = nil
+                    presentSuccessfulOperationTip(.deactivation)
+                } catch {
+                    spoofState = .active
+                    manualHint = error.localizedDescription
+                }
+                locationOperationTask = nil
+            }
+            return
+        }
+
         actions.clear()
         spoofState = .idle
         activeSpoofLat = nil
         activeSpoofLon = nil
-        showDisableTip = true
+        lastSpoofDiagnosisSystem = nil
+        hasLoggedSpoofDiagnosis = false
+        presentSuccessfulOperationTip(.deactivation)
+    }
+
+    private func presentSuccessfulOperationTip(_ kind: VirtualLocationTipKind) {
+        let count = tipPreferences.recordSuccessfulOperation(kind)
+        let operationName = kind == .activation ? "开启" : "关闭"
+        RuntimeLogger.info("APP", "提醒", "累计\(operationName)虚拟定位次数", details: [
+            "次数": String(count),
+            "运行模式": runtimeMode.mode.displayName,
+            "可显示不再提醒": String(tipPreferences.canSuppress(kind))
+        ])
+        guard tipPreferences.shouldPresentAutomaticTip(kind) else { return }
+        switch kind {
+        case .activation:
+            showEnableTip = true
+        case .deactivation:
+            showDisableTip = true
+        }
     }
 
 
@@ -565,49 +753,194 @@ let revision = mapState.selectMapTap(coordinate)
                 mapState.selection.coordinate.latitude,
                 mapState.selection.coordinate.longitude
             ),
-            latitude: mapState.selection.coordinate.latitude,
-            longitude: mapState.selection.coordinate.longitude,
+            coordinatePair: .init(
+                mapCoordinate: mapState.selection.coordinate,
+                mapCoordinateSystem: CoordinateConverter.currentMapCoordinateSystem
+            ),
             accuracy: 25
         )
     }
 
     private var testFavorite: FavoriteLocation { currentSelectionFavorite }
 
-    private func initializeMap() {
-        guard !mapDidInitialize else { return }
-        mapDidInitialize = true
-        CoordinateConverter.detectTileByFixedGeocode()
+    private func startMapRuntimeOnce() {
+        guard !mapRuntimeDidStart else { return }
+        mapRuntimeDidStart = true
+        let pair = LastCoordinateStore.load()?.coordinatePair
+            ?? CoordinatePair(
+                mapCoordinate: mapState.selection.coordinate,
+                mapCoordinateSystem: CoordinateConverter.currentMapCoordinateSystem
+            )
+        scheduleGeocode(pair: pair, revision: mapState.selection.revision)
+    }
 
-        if let selected = favorites.selectedFavorite {
-            let display = CoordinateConverter.toDisplay(lat: selected.latitude, lon: selected.longitude)
-            mapState.selectFavorite(
-                CLLocationCoordinate2D(latitude: display.lat, longitude: display.lon),
-                id: selected.id,
-                name: selected.name
-            )
-            LastCoordinateStore.save(lat: selected.latitude, lon: selected.longitude)
-        } else {
-            mapState.focusSelection(distanceMeters: mapState.viewportMeters)
-            scheduleGeocode(
-                coordinate: mapState.selection.coordinate,
-                revision: mapState.selection.revision
-            )
+    private func reprojectMapSelection(for change: CoordinateConverter.MapCoordinateSystemChange) {
+        // Every current selection is persisted as a complete coordinate pair at
+        // its input boundary. Replaying the matching stored representation
+        // avoids a second GCJ/WGS conversion and its accumulated offset.
+        guard let stored = LastCoordinateStore.load() else {
+            RuntimeLogger.warning("APP", "坐标转换", "地图坐标标准切换时未找到当前选点缓存")
+            return
         }
+        mapState.reprojectSelectionForMapCoordinateSystemChange(stored.coordinate(for: change.current))
+        RuntimeLogger.info("APP", "坐标转换", "地图坐标标准切换后已使用缓存坐标对回显当前选点", details: [
+            "from": change.previous.rawValue,
+            "to": change.current.rawValue
+        ])
+    }
 
-        // 启动坐标获取优先级：缓存 > 实时定位 > 深圳兜底（init 时已给兜底）
-        let savedCoord = LastCoordinateStore.load()
-        if savedCoord == nil {
-            requestRealtimeLocation()
+    private func registerWiFiChangeObserver() {
+        guard runtimeMode.mode == .localWiFi else { return }
+        guard wifiChangeObserverToken == nil else { return }
+        wifiChangeObserverToken = net.observeWiFiChanges { [self] reason in
+            handleWiFiChange(reason: reason)
+        }
+    }
+
+    private func refreshThirdPartyState() {
+        guard runtimeMode.mode == .thirdParty,
+              locationOperationTask == nil else { return }
+        locationOperationTask = Task { @MainActor in
+            do {
+                let response = try await thirdPartyProxy.query()
+                if response.success,
+                   let latitude = response.latitude,
+                   let longitude = response.longitude {
+                    activeSpoofLat = latitude
+                    activeSpoofLon = longitude
+                    spoofState = .active
+                } else if response.error?.contains("无已保存") == true {
+                    activeSpoofLat = nil
+                    activeSpoofLon = nil
+                    spoofState = .idle
+                } else {
+                    spoofState = .idle
+                    RuntimeLogger.warning("APP", "ThirdPartyProxy", "第三方代理查询返回失败", details: [
+                        "错误": response.error ?? "未知错误"
+                    ])
+                }
+            } catch {
+                spoofState = .idle
+                RuntimeLogger.warning("APP", "ThirdPartyProxy", "启动后第三方代理状态查询失败", details: [
+                    "错误": error.localizedDescription
+                ])
+            }
+            locationOperationTask = nil
+        }
+    }
+
+    private func handleWiFiChange(reason: WiFiChangeReason) {
+        RuntimeLogger.info("APP", "WiFi", "检测到 Wi-Fi 网络变化", details: [
+            "原因": reason.rawValue,
+            "虚拟定位已开启": String(spoofState == .active)
+        ])
+        guard spoofState == .active else { return }
+        if wifiVerificationTask != nil {
+            RuntimeLogger.info("APP", "WiFi", "网络仍在变化，重新计算环境检测等待时间")
+        }
+        wifiVerificationTask?.cancel()
+        let verificationID = UUID()
+        wifiVerificationID = verificationID
+        wifiVerificationTask = Task { @MainActor in
+            defer {
+                if wifiVerificationID == verificationID {
+                    wifiVerificationTask = nil
+                    wifiVerificationID = nil
+                }
+            }
+            let stabilizationNanoseconds: UInt64 = 3_000_000_000
+            RuntimeLogger.info("APP", "WiFi", "等待 Wi-Fi 连接稳定后检测", details: [
+                "等待秒数": "3",
+                "事件原因": reason.rawValue
+            ])
+            do {
+                try await Task.sleep(nanoseconds: stabilizationNanoseconds)
+            } catch {
+                RuntimeLogger.debug("APP", "WiFi", "延时检测已被更新的网络事件取消")
+                return
+            }
+            guard !Task.isCancelled, spoofState == .active else { return }
+            guard net.isSatisfied, net.isWiFiEnabled else {
+                RuntimeLogger.warning("APP", "WiFi", "稳定等待结束后仍未连接 Wi-Fi，提示检查代理", details: [
+                    "网络可用": String(net.isSatisfied),
+                    "Wi-Fi接口": String(net.isWiFiEnabled)
+                ])
+                activeTip = .proxySetup
+                return
+            }
+
+            // A manual diagnostics request can occupy the verifier for its full
+            // eight-second URL timeout. Wait long enough to run this check after
+            // it finishes instead of silently dropping the Wi-Fi-change check.
+            let maximumAttempts = 11
+            for attempt in 1...maximumAttempts {
+                RuntimeLogger.info("APP", "WiFi", "开始后台环境检测", details: [
+                    "尝试": "\(attempt)/\(maximumAttempts)",
+                    "SSID可读取": String(net.currentSSID != nil)
+                ])
+                let result = await setup.runVerificationTest()
+                guard !Task.isCancelled, spoofState == .active else { return }
+                if result == .verificationInProgress, attempt < maximumAttempts {
+                    RuntimeLogger.info("APP", "WiFi", "已有环境检测运行，1 秒后重试", details: [
+                        "尝试": "\(attempt)/\(maximumAttempts)"
+                    ])
+                    do {
+                        try await Task.sleep(nanoseconds: 1_000_000_000)
+                    } catch {
+                        return
+                    }
+                    continue
+                }
+
+                if result == .certNotTrusted {
+                    RuntimeLogger.warning("APP", "WiFi", "后台环境检测发现证书异常，进入证书安装引导")
+                    activeTip = nil
+                    setup.applyVerificationResult(result)
+                    return
+                }
+
+                let tip = result.wifiChangeReminderTipKind
+                RuntimeLogger.info("APP", "WiFi", "后台环境检测完成", details: [
+                    "结果": result.id,
+                    "success": String(result.isSuccess),
+                    "提示": tip?.rawValue ?? "无"
+                ])
+                if !result.isSuccess, let tip {
+                    activeTip = tip
+                } else if result == .verificationInProgress {
+                    RuntimeLogger.warning("APP", "WiFi", "环境检测连续被占用，本次不重复弹窗")
+                }
+                return
+            }
         }
     }
 
     private func requestRealtimeLocation() {
         let intent = mapState.beginRealtimeIntent()
+        RuntimeLogger.info("APP", "实时定位", "用户点击实时定位", details: [
+            "intentID": String(intent.id),
+            "选点revision": String(intent.selectionRevision),
+            "当前地图标准": CoordinateConverter.currentMapCoordinateSystem.rawValue,
+            "蓝点缓存存在": String(mapState.realtimeLocation != nil),
+            "CLLocationManager请求中": String(realtime.isRequesting)
+        ])
         // 蓝点存在就直接用，不限时（MKMapView 的 userLocation 只在位置变化时才更新）
         if let loc = mapState.realtimeLocation {
-            acceptRealtimeLocation(loc.coordinate, intent: intent, source: "MapKit蓝点")
+            RealtimeLocationTrace.log("实时定位按钮直接使用 MapKit 蓝点缓存", location: loc, details: [
+                "intentID": String(intent.id),
+                "来源": "MapLocationState.realtimeLocation"
+            ])
+            acceptRealtimeLocation(
+                loc.coordinate,
+                intent: intent,
+                source: .mapKitBluePoint,
+                sourceDescription: "MapKit蓝点缓存"
+            )
             return
         }
+        RuntimeLogger.info("APP", "实时定位", "MapKit 蓝点尚不可用，启动 CLLocationManager 兜底", details: [
+            "intentID": String(intent.id)
+        ])
         startRealtimeLocationRequest(
             source: "CLLocationManager",
             showFailureAlert: true,
@@ -617,14 +950,60 @@ let revision = mapState.selectMapTap(coordinate)
 
     private func handleNativeRealtimeLocation(_ location: CLLocation) {
         mapState.updateRealtimeLocation(location)
-        guard let context = realtimeRequestContext else { return }
+        logSpoofCoordinateDiagnosisIfNeeded(location)
+        guard let context = realtimeRequestContext else {
+            return
+        }
+
+        RealtimeLocationTrace.log("主页收到待处理请求所需的 MapKit 蓝点回调", location: location, details: [
+            "当前选点revision": String(mapState.selection.revision)
+        ])
 
         // MKMapView's MKUserLocation is the visible blue point. When it arrives,
         // fulfill the pending intent from that exact sample and cancel the slower
         // CLLocationManager fallback so the camera and dot cannot disagree.
         realtimeRequestContext = nil
         realtimeRequestTask?.cancel()
-        acceptRealtimeLocation(location.coordinate, intent: context.intent, source: "蓝点(途中)→\(context.source)")
+        RuntimeLogger.info("APP", "实时定位", "MapKit 蓝点抢先完成请求，取消 CLLocationManager 兜底", details: [
+            "intentID": String(context.intent.id),
+            "原兜底来源": context.source
+        ])
+        acceptRealtimeLocation(
+            location.coordinate,
+            intent: context.intent,
+            source: .mapKitBluePoint,
+            sourceDescription: "蓝点(途中)→\(context.source)"
+        )
+    }
+
+    private func logSpoofCoordinateDiagnosisIfNeeded(_ location: CLLocation) {
+        guard spoofState == .active,
+              let latitude = activeSpoofLat,
+              let longitude = activeSpoofLon else { return }
+        let targetPair = CoordinateConverter.coordinatePair(
+            lat: latitude,
+            lon: longitude,
+            mapCoordinateSystem: .wgs84
+        )
+        let diagnosis = CoordinateConverter.diagnoseRepresentation(
+            sample: location.coordinate,
+            pair: targetPair,
+            maximumDistance: max(1_000, location.horizontalAccuracy * 4),
+            minimumSeparation: max(30, location.horizontalAccuracy)
+        )
+        let shouldLog = !hasLoggedSpoofDiagnosis
+            || diagnosis.inferredSystem != lastSpoofDiagnosisSystem
+        guard shouldLog else { return }
+        hasLoggedSpoofDiagnosis = true
+        lastSpoofDiagnosisSystem = diagnosis.inferredSystem
+        RuntimeLogger.info("APP", "坐标转换", "虚拟定位开启后的 MapKit 蓝点标准判定", details: [
+            "当前地图标准": CoordinateConverter.currentMapCoordinateSystem.diagnosticName,
+            "WLOC目标标准": CoordinateConverter.MapCoordinateSystem.wgs84.diagnosticName,
+            "蓝点回调更接近": diagnosis.inferredName,
+            "蓝点距WGS目标米": String(format: "%.1f", diagnosis.distanceToWGS84),
+            "蓝点距GCJ目标米": String(format: "%.1f", diagnosis.distanceToGCJ02),
+            "日志策略": "每次开启首次或判定变化"
+        ])
     }
 
     private func startRealtimeLocationRequest(
@@ -638,16 +1017,34 @@ let revision = mapState.selectMapTap(coordinate)
             source: source,
             showFailureAlert: showFailureAlert
         )
+        RuntimeLogger.info("APP", "实时定位", "登记实时定位请求上下文", details: [
+            "intentID": String(intent.id),
+            "选点revision": String(intent.selectionRevision),
+            "来源": source,
+            "失败时提示": String(showFailureAlert),
+            "任务已存在": String(realtimeRequestTask != nil),
+            "manager请求中": String(realtime.isRequesting)
+        ])
 
         // A button tap during the startup request retargets that same in-flight
         // Core Location request to the newer intent instead of being ignored.
-        guard realtimeRequestTask == nil, !realtime.isRequesting else { return }
+        guard realtimeRequestTask == nil, !realtime.isRequesting else {
+            RuntimeLogger.info("APP", "实时定位", "复用进行中的 CLLocationManager 请求并更新意图上下文", details: [
+                "intentID": String(intent.id)
+            ])
+            return
+        }
         realtimeRequestTask = Task { @MainActor in
             defer {
                 realtimeRequestTask = nil
                 realtimeRequestContext = nil
             }
             guard let coordinate = await realtime.requestLocation() else {
+                RuntimeLogger.warning("APP", "实时定位", "CLLocationManager 兜底未返回坐标", details: [
+                    "授权状态rawValue": String(realtime.authorizationStatus.rawValue),
+                    "任务已取消": String(Task.isCancelled),
+                    "上下文存在": String(realtimeRequestContext != nil)
+                ])
                 guard let context = realtimeRequestContext,
                       context.showFailureAlert,
                       !Task.isCancelled,
@@ -656,33 +1053,80 @@ let revision = mapState.selectMapTap(coordinate)
                 showLocationAlert = true
                 return
             }
-            guard !Task.isCancelled, let context = realtimeRequestContext else { return }
-            acceptRealtimeLocation(coordinate, intent: context.intent, source: context.source)
+            RealtimeLocationTrace.coordinate("主页收到 CLLocationManager 兜底坐标", coordinate: coordinate, details: [
+                "任务已取消": String(Task.isCancelled)
+            ])
+            guard !Task.isCancelled, let context = realtimeRequestContext else {
+                RuntimeLogger.info("APP", "实时定位", "丢弃 CLLocationManager 结果：任务已取消或蓝点已抢先完成", details: [
+                    "任务已取消": String(Task.isCancelled),
+                    "上下文存在": String(realtimeRequestContext != nil)
+                ])
+                return
+            }
+            acceptRealtimeLocation(
+                coordinate,
+                intent: context.intent,
+                source: .coreLocation,
+                sourceDescription: context.source
+            )
         }
     }
 
     private func acceptRealtimeLocation(
         _ coordinate: CLLocationCoordinate2D,
         intent: RealtimeLocationIntent,
-        source: String
+        source: RealtimeCoordinateSource,
+        sourceDescription: String
     ) {
         let currentViewport = mapState.viewportMeters
-        let accepted = mapState.acceptRealtimeLocation(coordinate, intent: intent)
-        RuntimeLogger.info("APP", "地图", "\(source)返回", details: [
+        let previousMapCoordinateSystem = CoordinateConverter.currentMapCoordinateSystem
+        let sourceCoordinateSystem = source.coordinateSystem
+        let mapCoordinateSystemChange = source == .coreLocation
+            ? CoordinateConverter.correctMapCoordinateSystemUsingRealtime(coordinate)
+            : nil
+        if let change = mapCoordinateSystemChange {
+            reprojectMapSelection(for: change)
+        }
+        let pair = CoordinateConverter.coordinatePair(
+            lat: coordinate.latitude,
+            lon: coordinate.longitude,
+            mapCoordinateSystem: sourceCoordinateSystem
+        )
+        let accepted = mapState.acceptRealtimeLocation(
+            pair.coordinate(for: CoordinateConverter.currentMapCoordinateSystem),
+            intent: intent
+        )
+        RuntimeLogger.info("APP", "实时定位", "实时定位坐标完成标准判断并提交到地图", details: [
+            "来源": sourceDescription,
+            "来源类型": source.diagnosticName,
+            "输入坐标标准": sourceCoordinateSystem.diagnosticName,
+            "intentID": String(intent.id),
+            "intent选点revision": String(intent.selectionRevision),
+            "当前选点revision": String(mapState.selection.revision),
+            "修正前地图标准": previousMapCoordinateSystem.rawValue,
+            "修正后地图标准": CoordinateConverter.currentMapCoordinateSystem.rawValue,
+            "地图标准发生修正": String(mapCoordinateSystemChange != nil),
             "accepted": String(accepted),
-            "lat": String(coordinate.latitude),
-            "lon": String(coordinate.longitude)
+            "显示坐标字段": CoordinateConverter.currentMapCoordinateSystem.rawValue,
+            "持久化字段": "WGS-84+GCJ-02"
+        ])
+        RealtimeLocationTrace.coordinate("原始实时定位坐标", coordinate: coordinate, details: [
+            "来源": sourceDescription,
+            "输入坐标标准": sourceCoordinateSystem.diagnosticName
+        ])
+        RealtimeLocationTrace.coordinate("地图实际显示坐标", coordinate: pair.coordinate(for: CoordinateConverter.currentMapCoordinateSystem), details: [
+            "地图标准": CoordinateConverter.currentMapCoordinateSystem.rawValue
         ])
         guard accepted else { return }
         // 用点击时的缩放级别居中，不改变缩放
         mapState.focusSelection(distanceMeters: currentViewport)
-        // 蓝点坐标已是 WGS-84，直接存，不需要 toStored
-        LastCoordinateStore.save(lat: coordinate.latitude, lon: coordinate.longitude)
+        // Persist both forms once from the explicitly typed input boundary.
+        LastCoordinateStore.save(coordinatePair: pair, zoomMeters: currentViewport)
         favorites.select(nil)
-        scheduleGeocode(coordinate: coordinate, revision: mapState.selection.revision)
+        scheduleGeocode(pair: pair, revision: mapState.selection.revision)
     }
 
-    private func scheduleGeocode(coordinate: CLLocationCoordinate2D, revision: UInt64) {
+    private func scheduleGeocode(pair: CoordinatePair, revision: UInt64) {
         geocodeDebounceTask?.cancel()
         reverseGeocodeTask?.cancel()
         geocodeDebounceTask = Task { @MainActor in
@@ -692,13 +1136,15 @@ let revision = mapState.selectMapTap(coordinate)
                 return
             }
             guard !Task.isCancelled, mapState.selection.revision == revision else { return }
-            reverseGeocode(coordinate, revision: revision)
+            reverseGeocode(pair, revision: revision)
         }
     }
 
-    private func reverseGeocode(_ coordinate: CLLocationCoordinate2D, revision: UInt64) {
+    private func reverseGeocode(_ pair: CoordinatePair, revision: UInt64) {
         reverseGeocodeTask?.cancel()
-        let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+        let wgsCoordinate = pair.wgs84.coordinate
+        let mapCoordinate = pair.coordinate(for: CoordinateConverter.currentMapCoordinateSystem)
+        let location = CLLocation(latitude: wgsCoordinate.latitude, longitude: wgsCoordinate.longitude)
         reverseGeocodeTask = Task { @MainActor in
             let retryDelays: [UInt64] = [0, 800_000_000, 1_600_000_000]
             var lastError: Error?
@@ -715,7 +1161,7 @@ let revision = mapState.selectMapTap(coordinate)
                     // MKLocalSearch 在无结果时抛错，不可与 CLGeocoder 共用 try await 导致互相影响
                     async let clPlacemarks = CLGeocoder().reverseGeocodeLocation(location)
                     let mkRequest = MKLocalSearch.Request()
-                    mkRequest.region = MKCoordinateRegion(center: coordinate, latitudinalMeters: 400, longitudinalMeters: 400)
+                    mkRequest.region = MKCoordinateRegion(center: mapCoordinate, latitudinalMeters: 400, longitudinalMeters: 400)
                     let mkResponse = try? await MKLocalSearch(request: mkRequest).start()
 
                     let placemarks = try await clPlacemarks
@@ -723,12 +1169,8 @@ let revision = mapState.selectMapTap(coordinate)
                           mapState.selection.revision == revision,
                           let placemark = placemarks.first else { return }
 
-                    if let firstItem = mkResponse?.mapItems.first {
-                        RuntimeLogger.info("APP", "Geocode", "MKLocalSearch 坐标对比", details: [
-                            "输入坐标": "\(coordinate.latitude), \(coordinate.longitude)",
-                            "搜索返回坐标": "\(firstItem.placemark.coordinate.latitude), \(firstItem.placemark.coordinate.longitude)",
-                            "名称": firstItem.name ?? "nil"
-                        ])
+                    if mkResponse?.mapItems.first != nil {
+                        RuntimeLogger.info("APP", "Geocode", "MKLocalSearch 返回地点结果")
                     }
                     let mapItemName = mkResponse?.mapItems.first?.name?.trimmingCharacters(in: .whitespacesAndNewlines)
                     let mapItemPOI = mkResponse?.mapItems.first?.placemark.areasOfInterest?.first
@@ -805,9 +1247,8 @@ let revision = mapState.selectMapTap(coordinate)
                             .joined(separator: " · "),
                         coordinate: item.placemark.coordinate
                     )
-                    RuntimeLogger.info("APP", "搜索", "结果: \(r.name)", details: [
-                        "lat": String(r.coordinate.latitude),
-                        "lon": String(r.coordinate.longitude)
+                    RuntimeLogger.info("APP", "搜索", "获得搜索结果", details: [
+                        "名称": r.name
                     ])
                     return r
                 }
@@ -821,8 +1262,11 @@ let revision = mapState.selectMapTap(coordinate)
         reverseGeocodeTask?.cancel()
         favorites.select(nil)
         mapState.selectSearchResult(result.coordinate, name: result.name)
-        let wgs = CoordinateConverter.toStored(lat: result.coordinate.latitude, lon: result.coordinate.longitude)
-        LastCoordinateStore.save(lat: wgs.lat, lon: wgs.lon)
+        LastCoordinateStore.save(
+            mapCoordinate: result.coordinate,
+            mapCoordinateSystem: CoordinateConverter.currentMapCoordinateSystem,
+            zoomMeters: mapState.viewportMeters
+        )
         searchText = result.name
         searchResults = []
         searchError = ""
@@ -836,35 +1280,64 @@ let revision = mapState.selectMapTap(coordinate)
         geocodeDebounceTask?.cancel()
         reverseGeocodeTask?.cancel()
         favorites.select(favorite.id)
-        let display = CoordinateConverter.toDisplay(lat: favorite.latitude, lon: favorite.longitude)
+        RuntimeLogger.info("APP", "坐标转换", "点击收藏点并回显到地图", details: [
+            "当前地图标准": CoordinateConverter.currentMapCoordinateSystem.diagnosticName,
+            "地图取值字段": CoordinateConverter.currentMapCoordinateSystem == .gcj02 ? "coordinatePair.gcj02" : "coordinatePair.wgs84",
+            "保存数据包含": "国际标准(WGS-84)+国内标准(GCJ-02)"
+        ])
         mapState.selectFavorite(
-            CLLocationCoordinate2D(latitude: display.lat, longitude: display.lon),
+            favorite.coordinatePair.coordinate(for: CoordinateConverter.currentMapCoordinateSystem),
             id: favorite.id,
             name: favorite.name
         )
-        LastCoordinateStore.save(lat: favorite.latitude, lon: favorite.longitude)
+        LastCoordinateStore.save(
+            coordinatePair: favorite.coordinatePair,
+            zoomMeters: mapState.viewportMeters
+        )
     }
 
     private var enableTipSheet: some View {
         NavigationView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    ActivationTipContent(dismiss: {})
-                    if activationTipCount >= 3 {
-                        Button(role: .destructive) {
-                            activationTipDisabled = true
-                            showEnableTip = false
-                        } label: {
-                            Label("关闭不再弹出", systemImage: "bell.slash").frame(maxWidth: .infinity)
-                        }.buttonStyle(.bordered)
-                    }
+                    ActivationTipContent(runtimeMode: runtimeMode.mode, dismiss: {})
                 }.padding(16)
             }
             .navigationTitle("虚拟定位已开启").navigationBarTitleDisplayMode(.inline)
             .safeAreaInset(edge: .bottom) {
-                Button { showEnableTip = false } label: {
-                    Text("知道了").font(.body.weight(.medium)).frame(maxWidth: .infinity).padding(.vertical, 12)
-                }.buttonStyle(.borderedProminent).tint(.blue).padding(.horizontal, 16).padding(.bottom, 8)
+                HStack(spacing: 12) {
+                    if tipPreferences.canSuppress(.activation) {
+                        Button {
+                            tipPreferences.suppress(.activation)
+                            showEnableTip = false
+                        } label: {
+                            Label("不再提醒", systemImage: "bell.slash.fill")
+                                .font(.body.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
+
+                        Button { showEnableTip = false } label: {
+                            Text("知道了")
+                                .font(.body.weight(.medium))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.blue)
+                    } else {
+                        Button { showEnableTip = false } label: {
+                            Text("知道了")
+                                .font(.body.weight(.medium))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.blue)
+                    }
+                }.padding(.horizontal, 16).padding(.bottom, 8)
             }
         }
     }
@@ -873,15 +1346,47 @@ let revision = mapState.selectMapTap(coordinate)
         NavigationView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    DeactivationTipContent(dismiss: {})
-                    RemoveProxyTipContent(dismiss: {})
+                    DeactivationTipContent(runtimeMode: runtimeMode.mode, dismiss: {})
+                    if runtimeMode.mode == .localWiFi {
+                        RemoveProxyTipContent(dismiss: {})
+                    }
                 }.padding(16)
             }
             .navigationTitle("虚拟定位已关闭").navigationBarTitleDisplayMode(.inline)
             .safeAreaInset(edge: .bottom) {
-                Button { showDisableTip = false } label: {
-                    Text("知道了").font(.body.weight(.medium)).frame(maxWidth: .infinity).padding(.vertical, 12)
-                }.buttonStyle(.borderedProminent).tint(.blue).padding(.horizontal, 16).padding(.bottom, 8)
+                HStack(spacing: 12) {
+                    if tipPreferences.canSuppress(.deactivation) {
+                        Button {
+                            tipPreferences.suppress(.deactivation)
+                            showDisableTip = false
+                        } label: {
+                            Label("不再提醒", systemImage: "bell.slash.fill")
+                                .font(.body.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
+
+                        Button { showDisableTip = false } label: {
+                            Text("知道了")
+                                .font(.body.weight(.medium))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.blue)
+                    } else {
+                        Button { showDisableTip = false } label: {
+                            Text("知道了")
+                                .font(.body.weight(.medium))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.blue)
+                    }
+                }.padding(.horizontal, 16).padding(.bottom, 8)
             }
         }
     }

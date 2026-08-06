@@ -8,8 +8,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "1.0.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "1.0.1"
+    CURRENT_PROJECT_VERSION: "2"
     CODE_SIGN_STYLE: Manual
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
@@ -32,13 +32,17 @@ targets:
         HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/Core"
         SWIFT_OBJC_BRIDGING_HEADER: App/PaopaoLocationSpoofer-Bridging-Header.h
         OTHER_LDFLAGS: "$(inherited) -lwloccore"
-        LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/Core/build"
+        LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/Core/build/$(PLATFORM_NAME)"
 
   PaopaoLocationSpooferTests:
     type: bundle.unit-test
     platform: iOS
     sources:
       - path: Tests/PaopaoLocationSpooferTests
+    settings:
+      base:
+        HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/Core"
+        SWIFT_OBJC_BRIDGING_HEADER: App/PaopaoLocationSpoofer-Bridging-Header.h
     dependencies:
       - target: PaopaoLocationSpoofer
 
